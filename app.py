@@ -61,13 +61,36 @@ def _clean_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)[:280]
 
 # ── CANDIDATE FETCHER ────────────────────────────────────────────────────────
-def fetch_candidates(genre_ids: list, tag_ids: list, exclude_id: int, count: int = 60) -> list:
+def _parse_candidate(g: dict) -> dict:
+    """Parse a RAWG game result dict into our candidate schema."""
+    return {
+        "id":         g["id"],
+        "name":       g["name"],
+        "background": g.get("background_image") or "",
+        "rating":     g.get("rating", 0),
+        "metacritic": g.get("metacritic") or 0,
+        "playtime":   g.get("playtime") or 0,
+        "released":   g.get("released", ""),
+        "genres":     [x["name"] for x in g.get("genres", [])],
+        "genre_ids":  [x["id"]   for x in g.get("genres", [])],
+        "tags":       [x["id"]   for x in g.get("tags", [])[:30]],
+        "platforms":  [x["platform"]["id"] for x in g.get("platforms", [])],
+    }
+
+def fetch_candidates(genre_ids: list, tag_ids: list, exclude_id: int, count: int = 80) -> list:
     """
-    Pull games that share genres with the seed game.
-    Two pages of results; exclude the seed game.
+    Pull a rich candidate pool using two complementary strategies:
+      1. Genre-based  — 2 pages ordered by rating (broad genre match)
+      2. Tag-based    — 1 page using seed's top 4 tags (thematic/mechanic match)
+    Results are deduplicated by ID. Low-quality games are filtered out.
     """
     genres_str = ",".join(str(x) for x in genre_ids[:3])
-    candidates = []
+    top_tags   = ",".join(str(x) for x in tag_ids[:4])
+
+    seen: set = set()
+    candidates: list = []
+
+    # ── Batch 1: genre-based, two pages ──────────────────────────────────────
     for page in range(1, 3):
         try:
             data = rawg_get("/games", {
@@ -77,47 +100,92 @@ def fetch_candidates(genre_ids: list, tag_ids: list, exclude_id: int, count: int
                 "page":      page,
             })
             for g in data.get("results", []):
-                if g["id"] == exclude_id:
+                if g["id"] == exclude_id or g["id"] in seen:
                     continue
-                candidates.append({
-                    "id":         g["id"],
-                    "name":       g["name"],
-                    "background": g.get("background_image") or "",
-                    "rating":     g.get("rating", 0),
-                    "metacritic": g.get("metacritic") or 0,
-                    "playtime":   g.get("playtime") or 0,
-                    "released":   g.get("released", ""),
-                    "genres":     [x["name"] for x in g.get("genres", [])],
-                    "genre_ids":  [x["id"]   for x in g.get("genres", [])],
-                    "tags":       [x["id"]   for x in g.get("tags", [])[:30]],
-                    "platforms":  [x["platform"]["id"] for x in g.get("platforms", [])],
-                })
+                seen.add(g["id"])
+                candidates.append(_parse_candidate(g))
         except Exception as exc:
-            logging.warning("Candidate fetch page %d failed: %s", page, exc)
+            logging.warning("Genre fetch page %d failed: %s", page, exc)
+
+    # ── Batch 2: tag-based, one page (thematic reinforcement) ─────────────────
+    if top_tags:
+        try:
+            data = rawg_get("/games", {
+                "tags":      top_tags,
+                "ordering":  "-rating",
+                "page_size": 30,
+                "page":      1,
+            })
+            for g in data.get("results", []):
+                if g["id"] == exclude_id or g["id"] in seen:
+                    continue
+                seen.add(g["id"])
+                candidates.append(_parse_candidate(g))
+        except Exception as exc:
+            logging.warning("Tag fetch failed: %s", exc)
+
+    # ── Quality filter: drop very low-rated games ─────────────────────────────
+    candidates = [
+        c for c in candidates
+        if c["rating"] >= 1.5 or c["metacritic"] >= 40
+    ]
+
     return candidates[:count]
 
 # ── ML RECOMMENDER ───────────────────────────────────────────────────────────
 def build_feature_matrix(seed: dict, candidates: list):
     """
-    Content-based feature engineering:
-      • Genre multi-hot (weight ×3)
-      • Tag multi-hot (weight ×2) – top 30 tags from seed+candidates
-      • Platform multi-hot
-      • Normalised metacritic score
-      • Normalised log(playtime+1)
-    Returns (seed_vec, candidate_vecs, candidates).
-    """
-    all_games   = [seed] + candidates
-    all_genres  = sorted({g for game in all_games for g in game.get("genre_ids", [])})
-    all_tags    = sorted({t for game in all_games for t in game.get("tags", [])})
-    all_plats   = sorted({p for game in all_games for p in game.get("platforms", [])})
+    Seed-overlap-aware content-based feature engineering.
 
-    def encode(game):
-        genre_vec = [3.0 if g in game.get("genre_ids", []) else 0.0 for g in all_genres]
-        tag_vec   = [2.0 if t in game.get("tags",     []) else 0.0 for t in all_tags]
-        plat_vec  = [1.0 if p in game.get("platforms", []) else 0.0 for p in all_plats]
-        meta      = [game.get("metacritic", 0) / 100.0]
-        play      = [np.log1p(game.get("playtime", 0)) / 5.0]
+    Weight rationale
+    ─────────────────────────────────────────────────────────────────────────
+    • Primary genre (×14): The single most important signal. A visual-novel
+      must recommend visual-novels; an RPG must recommend RPGs.
+    • Other genres  (×10): Strong genre overlap still matters a lot.
+    • Seed-matched tags (×6): Tags the seed game has are the game's "DNA"
+      (mechanics, themes, mood). A candidate sharing those tags is a very
+      strong thematic match.
+    • Other tags (×0.8): Tags present in a candidate but absent from the seed
+      are near-noise — we keep a tiny weight to avoid zero-vectors but they
+      should not inflate similarity.
+    • Platforms (×0.2): Cross-platform era; irrelevant for theme/genre match.
+    • Metacritic / Playtime: Very low weights — quality is a secondary signal
+      and must not override genre/theme alignment.
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    all_games      = [seed] + candidates
+    all_genres     = sorted({g for game in all_games for g in game.get("genre_ids", [])})
+    all_tags       = sorted({t for game in all_games for t in game.get("tags", [])})
+    all_plats      = sorted({p for game in all_games for p in game.get("platforms", [])})
+
+    seed_tag_set   = set(seed.get("tags", []))
+    seed_genres    = seed.get("genre_ids", [])
+    primary_genre  = seed_genres[0] if seed_genres else None
+
+    def encode(game: dict) -> np.ndarray:
+        game_genre_set = set(game.get("genre_ids", []))
+        game_tag_set   = set(game.get("tags", []))
+        game_plat_set  = set(game.get("platforms", []))
+
+        # Genre vector — primary genre gets extra weight
+        genre_vec = [
+            (14.0 if g == primary_genre else 10.0) if g in game_genre_set else 0.0
+            for g in all_genres
+        ]
+
+        # Tag vector — seed-overlap aware
+        tag_vec = [
+            (6.0 if t in seed_tag_set else 0.8) if t in game_tag_set else 0.0
+            for t in all_tags
+        ]
+
+        # Platform vector — minimal contribution
+        plat_vec = [0.2 if p in game_plat_set else 0.0 for p in all_plats]
+
+        # Quality scalars — kept low so they don't override theme alignment
+        meta = [game.get("metacritic", 0) / 100.0 * 0.4]
+        play = [np.log1p(game.get("playtime", 0)) / 5.0 * 0.2]
+
         return np.array(genre_vec + tag_vec + plat_vec + meta + play, dtype=np.float32)
 
     seed_vec  = encode(seed)

@@ -416,42 +416,95 @@ async function getGameDetail(id) {
   };
 }
 
-async function fetchCandidates(genreIds, excludeId) {
+async function fetchCandidates(seed) {
+  const genreIds  = seed.genre_ids || [];
+  const tagIds    = seed.tags || [];
+  const excludeId = seed.id;
+
   const genresStr = genreIds.slice(0, 3).join(',');
+  const tagsStr   = tagIds.slice(0, 4).join(',');
+
+  const seen = new Set();
   const candidates = [];
+
+  function parseGame(g) {
+    return {
+      id:         g.id,
+      name:       g.name,
+      background: g.background_image || '',
+      rating:     g.rating     || 0,
+      metacritic: g.metacritic || 0,
+      playtime:   g.playtime   || 0,
+      released:   g.released   || '',
+      genres:     (g.genres    || []).map(x => x.name),
+      genre_ids:  (g.genres    || []).map(x => x.id),
+      tags:       (g.tags      || []).slice(0, 30).map(x => x.id),
+      platforms:  (g.platforms || []).map(x => x.platform.id),
+    };
+  }
+
+  // ── Batch 1: genre-based, two pages (broad genre pool) ──────────────────
   for (let page = 1; page <= 2; page++) {
     try {
-      const data = await rawg('/games', {
-        genres: genresStr, ordering: '-rating', page_size: 30, page
-      });
+      const data = await rawg('/games', { genres: genresStr, ordering: '-rating', page_size: 30, page });
       for (const g of (data.results || [])) {
-        if (g.id === excludeId) continue;
-        candidates.push({
-          id:         g.id,
-          name:       g.name,
-          background: g.background_image || '',
-          rating:     g.rating || 0,
-          metacritic: g.metacritic || 0,
-          playtime:   g.playtime   || 0,
-          released:   g.released   || '',
-          genres:     (g.genres    || []).map(x => x.name),
-          genre_ids:  (g.genres    || []).map(x => x.id),
-          tags:       (g.tags      || []).slice(0, 30).map(x => x.id),
-          platforms:  (g.platforms || []).map(x => x.platform.id),
-        });
+        if (g.id === excludeId || seen.has(g.id)) continue;
+        seen.add(g.id);
+        candidates.push(parseGame(g));
       }
     } catch(e) { /* skip failed pages */ }
   }
-  return candidates;
+
+  // ── Batch 2: tag-based, one page (thematic reinforcement) ───────────────
+  if (tagsStr) {
+    try {
+      const data = await rawg('/games', { tags: tagsStr, ordering: '-rating', page_size: 30, page: 1 });
+      for (const g of (data.results || [])) {
+        if (g.id === excludeId || seen.has(g.id)) continue;
+        seen.add(g.id);
+        candidates.push(parseGame(g));
+      }
+    } catch(e) { /* tag fetch failed, genre results still available */ }
+  }
+
+  // ── Quality filter ───────────────────────────────────────────────────────
+  return candidates.filter(c => c.rating >= 1.5 || c.metacritic >= 40);
 }
 
 /* ── ML: COSINE SIMILARITY RECOMMENDER ─────────────────────────────────── */
-function buildVector(game, allGenres, allTags, allPlats) {
-  const genreVec = allGenres.map(g => (game.genre_ids || []).includes(g) ? 3.0 : 0.0);
-  const tagVec   = allTags  .map(t => (game.tags      || []).includes(t) ? 2.0 : 0.0);
-  const platVec  = allPlats .map(p => (game.platforms  || []).includes(p) ? 1.0 : 0.0);
-  const meta     = [(game.metacritic || 0) / 100];
-  const play     = [Math.log1p(game.playtime || 0) / 5.0];
+/*
+ * Weight rationale
+ * ─────────────────────────────────────────────────────────────────────────
+ * primaryGenre (×14): The #1 signal. Visual-novel → visual-novels.
+ * otherGenres  (×10): Strong genre overlap still matters a great deal.
+ * seedTags     (×6) : Tags shared with the seed are the game's thematic DNA
+ *                     (mechanics, mood, setting). Strong match = high sim.
+ * otherTags    (×0.8): Tags present only in the candidate are near-noise —
+ *                      kept tiny to avoid zero-vectors, not to inflate sim.
+ * platforms    (×0.2): Cross-platform era — irrelevant for theme matching.
+ * metacritic   (×0.4): Quality signal, must not override theme alignment.
+ * playtime     (×0.2): Very weak — genre similarity dominates.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+function buildVector(game, seedTagSet, primaryGenre, allGenres, allTags, allPlats) {
+  const gameGenreSet = new Set(game.genre_ids || []);
+  const gameTagSet   = new Set(game.tags      || []);
+  const gamePlatSet  = new Set(game.platforms  || []);
+
+  const genreVec = allGenres.map(g => {
+    if (!gameGenreSet.has(g)) return 0.0;
+    return g === primaryGenre ? 14.0 : 10.0;
+  });
+
+  const tagVec = allTags.map(t => {
+    if (!gameTagSet.has(t)) return 0.0;
+    return seedTagSet.has(t) ? 6.0 : 0.8;
+  });
+
+  const platVec = allPlats.map(p => gamePlatSet.has(p) ? 0.2 : 0.0);
+  const meta    = [(game.metacritic || 0) / 100 * 0.4];
+  const play    = [Math.log1p(game.playtime || 0) / 5.0 * 0.2];
+
   return [...genreVec, ...tagVec, ...platVec, ...meta, ...play];
 }
 
@@ -468,10 +521,13 @@ function recommend(seed, candidates, topN = 5) {
   const allTags   = [...new Set(all.flatMap(g => g.tags      || []))].sort();
   const allPlats  = [...new Set(all.flatMap(g => g.platforms  || []))].sort();
 
-  const seedVec = buildVector(seed, allGenres, allTags, allPlats);
+  const seedTagSet    = new Set(seed.tags      || []);
+  const primaryGenre  = (seed.genre_ids || [])[0] ?? null;
+
+  const seedVec = buildVector(seed, seedTagSet, primaryGenre, allGenres, allTags, allPlats);
   const scored  = candidates.map(c => ({
     ...c,
-    sim: cosineSim(seedVec, buildVector(c, allGenres, allTags, allPlats))
+    sim: cosineSim(seedVec, buildVector(c, seedTagSet, primaryGenre, allGenres, allTags, allPlats))
   }));
 
   return scored
@@ -543,7 +599,7 @@ async function selectGame(id) {
 
   try {
     const seed       = await getGameDetail(id);
-    const candidates = await fetchCandidates(seed.genre_ids, id);
+    const candidates = await fetchCandidates(seed);
     const recs       = recommend(seed, candidates);
     renderSelected(seed);
     renderRecs(recs);
