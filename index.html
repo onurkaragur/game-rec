@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NEXUS — Game Recommender</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+/* ── RESET & VARIABLES ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #050508;
+  --surface:   #0d0d16;
+  --border:    rgba(0, 210, 255, 0.18);
+  --cyan:      #00d2ff;
+  --cyan-dim:  rgba(0, 210, 255, 0.12);
+  --magenta:   #ff2ef7;
+  --gold:      #ffd700;
+  --text:      #c8d8e8;
+  --text-dim:  #556677;
+  --card-bg:   rgba(13, 13, 24, 0.85);
+  --glow:      0 0 24px rgba(0, 210, 255, 0.35);
+  --glow-mg:   0 0 24px rgba(255, 46, 247, 0.3);
+  --radius:    6px;
+  --font-head: 'Orbitron', monospace;
+  --font-body: 'Rajdhani', sans-serif;
+}
+
+html, body { height: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 16px;
+  overflow-x: hidden;
+  cursor: none;
+}
+
+/* ── CURSOR ─────────────────────────────────────────────────────────────── */
+#cursor-dot {
+  position: fixed; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--cyan); pointer-events: none; z-index: 9999;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 12px var(--cyan), 0 0 24px var(--cyan);
+}
+#cursor-ring {
+  position: fixed; width: 36px; height: 36px; border-radius: 50%;
+  border: 1px solid rgba(0,210,255,0.5); pointer-events: none; z-index: 9998;
+  transform: translate(-50%, -50%);
+  transition: width 0.2s, height 0.2s;
+}
+body.clicking #cursor-ring { width: 20px; height: 20px; }
+
+/* ── CANVAS ──────────────────────────────────────────────────────────────── */
+#bgCanvas { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+
+/* ── LAYOUT ─────────────────────────────────────────────────────────────── */
+.app {
+  position: relative; z-index: 1;
+  min-height: 100vh;
+  display: flex; flex-direction: column; align-items: center;
+  padding: 60px 20px 100px;
+}
+
+/* ── API KEY BANNER ─────────────────────────────────────────────────────── */
+#apiBanner {
+  width: 100%; max-width: 640px;
+  background: rgba(255, 180, 0, 0.07);
+  border: 1px solid rgba(255, 180, 0, 0.3);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  margin-bottom: 28px;
+  display: none;
+}
+#apiBanner p {
+  font-size: 0.82rem; color: #ffb400; letter-spacing: 0.04em; line-height: 1.6;
+}
+#apiBanner strong { color: #fff; }
+.api-input-row { display: flex; gap: 8px; margin-top: 10px; }
+#apiKeyInput {
+  flex: 1; background: #0a0a12; border: 1px solid rgba(255,180,0,0.3);
+  color: #fff; font-family: var(--font-body); font-size: 0.85rem;
+  padding: 8px 12px; border-radius: var(--radius); outline: none;
+  letter-spacing: 0.04em;
+}
+#apiKeyInput:focus { border-color: #ffb400; }
+#apiKeySave {
+  background: rgba(255,180,0,0.15); border: 1px solid rgba(255,180,0,0.4);
+  color: #ffb400; font-family: var(--font-head); font-size: 0.65rem;
+  letter-spacing: 0.12em; padding: 8px 16px; border-radius: var(--radius);
+  cursor: pointer; transition: background 0.2s;
+}
+#apiKeySave:hover { background: rgba(255,180,0,0.28); }
+
+/* ── HEADER ─────────────────────────────────────────────────────────────── */
+header { text-align: center; margin-bottom: 44px; animation: fadeDown 0.8s ease both; }
+.logo {
+  font-family: var(--font-head);
+  font-size: clamp(2.4rem, 6vw, 4.5rem);
+  font-weight: 900; letter-spacing: 0.12em;
+  color: #fff;
+  text-shadow: 0 0 40px rgba(0,210,255,0.6), 0 0 80px rgba(0,210,255,0.25);
+  position: relative;
+}
+.logo span { color: var(--cyan); }
+.tagline {
+  font-size: 0.85rem; letter-spacing: 0.35em;
+  color: var(--text-dim); text-transform: uppercase; margin-top: 8px;
+}
+.logo::after {
+  content: attr(data-text); position: absolute; inset: 0;
+  color: var(--magenta);
+  clip-path: polygon(0 30%, 100% 30%, 100% 50%, 0 50%);
+  opacity: 0; animation: glitch 8s infinite;
+}
+@keyframes glitch {
+  0%,94%,100% { opacity:0; transform:none; }
+  95%          { opacity:0.6; transform:translateX(-4px); }
+  97%          { opacity:0.6; transform:translateX(4px) scaleY(1.02); }
+}
+
+/* ── SEARCH ─────────────────────────────────────────────────────────────── */
+.search-wrap {
+  width: 100%; max-width: 640px;
+  position: relative; animation: fadeDown 0.8s 0.15s ease both;
+}
+.search-box {
+  width: 100%; background: var(--surface);
+  border: 1px solid var(--border); color: #fff;
+  font-family: var(--font-body); font-size: 1.1rem; letter-spacing: 0.05em;
+  padding: 18px 56px 18px 22px; border-radius: var(--radius);
+  outline: none; transition: border-color 0.25s, box-shadow 0.25s;
+}
+.search-box::placeholder { color: var(--text-dim); }
+.search-box:focus {
+  border-color: var(--cyan);
+  box-shadow: var(--glow), inset 0 0 20px rgba(0,210,255,0.04);
+}
+.search-icon {
+  position: absolute; right: 18px; top: 50%; transform: translateY(-50%);
+  color: var(--text-dim); pointer-events: none; font-size: 1.2rem;
+}
+
+/* ── DROPDOWN ───────────────────────────────────────────────────────────── */
+.dropdown {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+  background: #0a0a14; border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; z-index: 100;
+  max-height: 380px; overflow-y: auto; display: none;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+}
+.dropdown.open { display: block; }
+.dropdown-item {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 16px; cursor: pointer;
+  transition: background 0.15s;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.dropdown-item:hover { background: var(--cyan-dim); }
+.dropdown-thumb {
+  width: 52px; height: 34px; object-fit: cover;
+  border-radius: 3px; flex-shrink: 0; background: #111;
+}
+.dropdown-name { font-size: 0.95rem; font-weight: 600; color: #fff; }
+.dropdown-meta { font-size: 0.78rem; color: var(--text-dim); margin-top: 2px; }
+.dd-spinner {
+  padding: 20px; text-align: center; color: var(--text-dim);
+  font-size: 0.85rem; letter-spacing: 0.1em;
+}
+
+/* ── SELECTED GAME ─────────────────────────────────────────────────────── */
+#selectedSection {
+  width: 100%; max-width: 860px; margin-top: 52px;
+  animation: fadeUp 0.6s ease both; display: none;
+}
+.section-label {
+  font-family: var(--font-head); font-size: 0.65rem;
+  letter-spacing: 0.4em; color: var(--cyan); text-transform: uppercase;
+  margin-bottom: 16px; display: flex; align-items: center; gap: 12px;
+}
+.section-label::after {
+  content: ''; flex: 1; height: 1px;
+  background: linear-gradient(to right, var(--border), transparent);
+}
+.selected-card {
+  display: grid; grid-template-columns: 320px 1fr; gap: 0;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; background: var(--card-bg);
+  backdrop-filter: blur(10px); box-shadow: var(--glow); position: relative;
+}
+.selected-card::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(to right, var(--cyan), var(--magenta), var(--cyan));
+}
+.selected-art {
+  width: 100%; height: 220px; object-fit: cover; display: block;
+  filter: brightness(0.9) saturate(1.1);
+}
+.selected-info { padding: 28px; display: flex; flex-direction: column; justify-content: center; }
+.selected-title {
+  font-family: var(--font-head);
+  font-size: clamp(1.2rem, 2.5vw, 1.65rem);
+  font-weight: 700; color: #fff; margin-bottom: 10px; line-height: 1.25;
+}
+.badge-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 14px; }
+.badge {
+  font-size: 0.72rem; font-family: var(--font-head); letter-spacing: 0.06em;
+  padding: 4px 10px; border-radius: 2px; border: 1px solid;
+}
+.badge-genre  { border-color: rgba(0,210,255,0.35); color: var(--cyan); background: rgba(0,210,255,0.07); }
+.rating-row { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: var(--text-dim); }
+.rating-val { font-family: var(--font-head); font-size: 1.3rem; font-weight: 700; color: var(--cyan); }
+.selected-desc {
+  margin-top: 12px; font-size: 0.88rem; color: var(--text-dim); line-height: 1.6;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+}
+
+/* ── RECOMMENDATIONS ────────────────────────────────────────────────────── */
+#recsSection { width: 100%; max-width: 860px; margin-top: 48px; display: none; }
+.recs-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
+.rec-card {
+  background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; cursor: pointer;
+  transition: transform 0.22s cubic-bezier(.34,1.56,.64,1), border-color 0.22s, box-shadow 0.22s;
+  position: relative;
+}
+.rec-card:hover { transform: translateY(-6px) scale(1.03); border-color: var(--cyan); box-shadow: var(--glow); z-index: 2; }
+.rec-card:nth-child(2):hover { border-color: var(--magenta); box-shadow: var(--glow-mg); }
+.rec-art {
+  width: 100%; aspect-ratio: 16/10; object-fit: cover; display: block;
+  filter: saturate(0.8); transition: filter 0.3s;
+}
+.rec-card:hover .rec-art { filter: saturate(1.2) brightness(1.05); }
+.rec-body { padding: 12px 12px 14px; }
+.rec-name {
+  font-family: var(--font-head); font-size: 0.68rem; font-weight: 700;
+  color: #fff; line-height: 1.3; margin-bottom: 7px;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.rec-meta { font-size: 0.72rem; color: var(--text-dim); display: flex; justify-content: space-between; align-items: center; }
+.rec-rating { color: var(--gold); font-weight: 600; }
+.sim-bar { margin-top: 8px; height: 2px; background: rgba(255,255,255,0.07); border-radius: 1px; overflow: hidden; }
+.sim-fill {
+  height: 100%; background: linear-gradient(to right, var(--cyan), var(--magenta));
+  border-radius: 1px; transition: width 1s 0.3s ease; width: 0%;
+}
+.sim-label { font-size: 0.62rem; color: var(--text-dim); margin-top: 4px; letter-spacing: 0.05em; }
+.rec-num {
+  position: absolute; top: 8px; left: 8px;
+  font-family: var(--font-head); font-size: 0.6rem; font-weight: 900;
+  color: var(--bg); padding: 2px 6px; border-radius: 2px;
+}
+.rec-card:nth-child(1) .rec-num { background: var(--cyan); }
+.rec-card:nth-child(2) .rec-num { background: var(--magenta); }
+.rec-card:nth-child(3) .rec-num,
+.rec-card:nth-child(4) .rec-num,
+.rec-card:nth-child(5) .rec-num  { background: var(--text-dim); }
+
+/* ── LOADING ─────────────────────────────────────────────────────────────── */
+.loading-wrap {
+  display: none; align-items: center; justify-content: center;
+  gap: 12px; padding: 40px;
+  font-family: var(--font-head); font-size: 0.75rem;
+  letter-spacing: 0.25em; color: var(--cyan);
+}
+.loading-wrap.active { display: flex; }
+.lds {
+  width: 30px; height: 30px; border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--cyan); border-right-color: var(--magenta);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── ERROR ──────────────────────────────────────────────────────────────── */
+.error-msg {
+  color: #ff4466; font-size: 0.85rem; letter-spacing: 0.05em;
+  padding: 12px 18px; border: 1px solid rgba(255,68,102,0.3);
+  border-radius: var(--radius); background: rgba(255,68,102,0.07);
+  margin-top: 16px; display: none; max-width: 640px; width: 100%;
+}
+
+/* ── ANIMATIONS ─────────────────────────────────────────────────────────── */
+@keyframes fadeDown { from { opacity:0; transform: translateY(-20px); } to { opacity:1; transform: translateY(0); } }
+@keyframes fadeUp   { from { opacity:0; transform: translateY(30px);  } to { opacity:1; transform: translateY(0); } }
+.stagger { animation: fadeUp 0.5s ease both; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+@media (max-width: 720px) {
+  .selected-card { grid-template-columns: 1fr; }
+  .selected-art  { height: 180px; }
+  .recs-grid     { grid-template-columns: repeat(2, 1fr); }
+  .recs-grid .rec-card:last-child { grid-column: 1 / -1; }
+}
+</style>
+</head>
+<body>
+
+<canvas id="bgCanvas"></canvas>
+<div id="cursor-dot"></div>
+<div id="cursor-ring"></div>
+
+<div class="app">
+
+  <header>
+    <div class="logo" data-text="NEXUS">NEX<span>US</span></div>
+    <p class="tagline">AI-Powered Game Discovery Engine</p>
+  </header>
+
+  <!-- API Key Banner -->
+  <div id="apiBanner">
+    <p>⚠ <strong>RAWG API key not set.</strong> Get a free key at <strong>rawg.io/apidocs</strong>, then paste it below.</p>
+    <div class="api-input-row">
+      <input id="apiKeyInput" type="text" placeholder="Paste your RAWG API key here…" />
+      <button id="apiKeySave" onclick="saveApiKey()">SAVE</button>
+    </div>
+  </div>
+
+  <!-- Search -->
+  <div class="search-wrap">
+    <input id="searchInput" class="search-box" type="text"
+           placeholder="Search a game you love…" autocomplete="off" />
+    <span class="search-icon">⌕</span>
+    <div id="dropdown" class="dropdown"></div>
+  </div>
+
+  <div id="errorMsg" class="error-msg"></div>
+  <div id="loading" class="loading-wrap"><div class="lds"></div><span>Analysing game DNA…</span></div>
+
+  <section id="selectedSection">
+    <div class="section-label">Selected Game</div>
+    <div class="selected-card" id="selectedCard"></div>
+  </section>
+
+  <section id="recsSection">
+    <div class="section-label">You Might Also Like</div>
+    <div class="recs-grid" id="recsGrid"></div>
+  </section>
+
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════════
+   CONFIG  —  paste your free RAWG API key here OR use the banner above
+   Get one at: https://rawg.io/apidocs
+   ══════════════════════════════════════════════════════════════════════════ */
+let RAWG_KEY = localStorage.getItem('rawg_key') || '';
+const RAWG   = 'https://api.rawg.io/api';
+
+/* ── API KEY MANAGEMENT ─────────────────────────────────────────────────── */
+function saveApiKey() {
+  const val = document.getElementById('apiKeyInput').value.trim();
+  if (!val) return;
+  RAWG_KEY = val;
+  localStorage.setItem('rawg_key', val);
+  document.getElementById('apiBanner').style.display = 'none';
+  showError('');
+}
+
+function checkApiKey() {
+  if (!RAWG_KEY) {
+    document.getElementById('apiBanner').style.display = 'block';
+    return false;
+  }
+  return true;
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  if (!RAWG_KEY) document.getElementById('apiBanner').style.display = 'block';
+});
+
+/* ── RAWG API HELPERS ───────────────────────────────────────────────────── */
+async function rawg(path, params = {}) {
+  params.key = RAWG_KEY;
+  const qs = new URLSearchParams(params).toString();
+  const res = await fetch(`${RAWG}${path}?${qs}`);
+  if (!res.ok) throw new Error(`RAWG ${res.status}: ${res.statusText}`);
+  return res.json();
+}
+
+async function searchGames(q) {
+  const data = await rawg('/games', { search: q, page_size: 8, search_precise: true });
+  return (data.results || []).map(g => ({
+    id:         g.id,
+    name:       g.name,
+    background: g.background_image || '',
+    rating:     g.rating || 0,
+    released:   g.released || '',
+    genres:     (g.genres || []).map(x => x.name),
+    genre_ids:  (g.genres || []).map(x => x.id),
+    tags:       (g.tags  || []).slice(0, 30).map(x => x.id),
+  }));
+}
+
+async function getGameDetail(id) {
+  const g = await rawg(`/games/${id}`);
+  return {
+    id:          g.id,
+    name:        g.name,
+    background:  g.background_image || '',
+    rating:      g.rating || 0,
+    metacritic:  g.metacritic || 0,
+    playtime:    g.playtime   || 0,
+    released:    g.released   || '',
+    description: (g.description_raw || g.description || '').replace(/<[^>]+>/g,'').slice(0, 280),
+    genres:      (g.genres    || []).map(x => x.name),
+    genre_ids:   (g.genres    || []).map(x => x.id),
+    tags:        (g.tags      || []).slice(0, 30).map(x => x.id),
+    platforms:   (g.platforms || []).map(x => x.platform.id),
+  };
+}
+
+async function fetchCandidates(genreIds, excludeId) {
+  const genresStr = genreIds.slice(0, 3).join(',');
+  const candidates = [];
+  for (let page = 1; page <= 2; page++) {
+    try {
+      const data = await rawg('/games', {
+        genres: genresStr, ordering: '-rating', page_size: 30, page
+      });
+      for (const g of (data.results || [])) {
+        if (g.id === excludeId) continue;
+        candidates.push({
+          id:         g.id,
+          name:       g.name,
+          background: g.background_image || '',
+          rating:     g.rating || 0,
+          metacritic: g.metacritic || 0,
+          playtime:   g.playtime   || 0,
+          released:   g.released   || '',
+          genres:     (g.genres    || []).map(x => x.name),
+          genre_ids:  (g.genres    || []).map(x => x.id),
+          tags:       (g.tags      || []).slice(0, 30).map(x => x.id),
+          platforms:  (g.platforms || []).map(x => x.platform.id),
+        });
+      }
+    } catch(e) { /* skip failed pages */ }
+  }
+  return candidates;
+}
+
+/* ── ML: COSINE SIMILARITY RECOMMENDER ─────────────────────────────────── */
+function buildVector(game, allGenres, allTags, allPlats) {
+  const genreVec = allGenres.map(g => (game.genre_ids || []).includes(g) ? 3.0 : 0.0);
+  const tagVec   = allTags  .map(t => (game.tags      || []).includes(t) ? 2.0 : 0.0);
+  const platVec  = allPlats .map(p => (game.platforms  || []).includes(p) ? 1.0 : 0.0);
+  const meta     = [(game.metacritic || 0) / 100];
+  const play     = [Math.log1p(game.playtime || 0) / 5.0];
+  return [...genreVec, ...tagVec, ...platVec, ...meta, ...play];
+}
+
+function cosineSim(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+function recommend(seed, candidates, topN = 5) {
+  const all = [seed, ...candidates];
+  const allGenres = [...new Set(all.flatMap(g => g.genre_ids || []))].sort();
+  const allTags   = [...new Set(all.flatMap(g => g.tags      || []))].sort();
+  const allPlats  = [...new Set(all.flatMap(g => g.platforms  || []))].sort();
+
+  const seedVec = buildVector(seed, allGenres, allTags, allPlats);
+  const scored  = candidates.map(c => ({
+    ...c,
+    sim: cosineSim(seedVec, buildVector(c, allGenres, allTags, allPlats))
+  }));
+
+  return scored
+    .sort((a, b) => b.sim - a.sim)
+    .slice(0, topN)
+    .map(c => ({
+      id:         c.id,
+      name:       c.name,
+      background: c.background,
+      rating:     c.rating,
+      released:   c.released,
+      genres:     c.genres,
+      similarity: Math.round(c.sim * 100 * 10) / 10,
+    }));
+}
+
+/* ── SEARCH UI ──────────────────────────────────────────────────────────── */
+const searchInput = document.getElementById('searchInput');
+const dropdown    = document.getElementById('dropdown');
+const errorEl     = document.getElementById('errorMsg');
+let debounceTimer;
+
+searchInput.addEventListener('input', () => {
+  clearTimeout(debounceTimer);
+  const q = searchInput.value.trim();
+  if (q.length < 2) { closeDropdown(); return; }
+  // Clear previous results as soon as the user starts a new search
+  hide('selectedSection');
+  hide('recsSection');
+  showError('');
+  debounceTimer = setTimeout(() => fetchSuggestions(q), 320);
+});
+searchInput.addEventListener('keydown', e => { if (e.key === 'Escape') closeDropdown(); });
+document.addEventListener('click', e => { if (!e.target.closest('.search-wrap')) closeDropdown(); });
+
+function closeDropdown() { dropdown.classList.remove('open'); dropdown.innerHTML = ''; }
+
+async function fetchSuggestions(q) {
+  if (!checkApiKey()) return;
+  dropdown.innerHTML = `<div class="dd-spinner">Scanning database…</div>`;
+  dropdown.classList.add('open');
+  try {
+    const games = await searchGames(q);
+    if (!games.length) { dropdown.innerHTML = `<div class="dd-spinner">No results found.</div>`; return; }
+    dropdown.innerHTML = games.map(g => `
+      <div class="dropdown-item" onclick="selectGame(${g.id})">
+        <img class="dropdown-thumb" src="${g.background || ''}" alt=""
+             onerror="this.style.display='none'">
+        <div>
+          <div class="dropdown-name">${esc(g.name)}</div>
+          <div class="dropdown-meta">${g.genres.slice(0,3).join(' · ')}
+            ${g.released ? ' · ' + g.released.slice(0,4) : ''} · ★ ${g.rating || '—'}
+          </div>
+        </div>
+      </div>`).join('');
+  } catch(err) {
+    dropdown.innerHTML = `<div class="dd-spinner">Error: ${esc(err.message)}</div>`;
+  }
+}
+
+/* ── SELECT GAME ────────────────────────────────────────────────────────── */
+async function selectGame(id) {
+  if (!checkApiKey()) return;
+  closeDropdown();
+  searchInput.value = '';
+  showLoading(true);
+  showError('');
+  hide('selectedSection'); hide('recsSection');
+
+  try {
+    const seed       = await getGameDetail(id);
+    const candidates = await fetchCandidates(seed.genre_ids, id);
+    const recs       = recommend(seed, candidates);
+    renderSelected(seed);
+    renderRecs(recs);
+  } catch(err) {
+    showError('Failed to load: ' + err.message +
+      (err.message.includes('401') ? ' — Check your RAWG API key.' : ''));
+  } finally {
+    showLoading(false);
+  }
+}
+
+/* ── RENDER ─────────────────────────────────────────────────────────────── */
+function renderSelected(g) {
+  const ph = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="320" height="220"><rect fill="%230d0d16" width="320" height="220"/></svg>';
+  document.getElementById('selectedCard').innerHTML = `
+    <img class="selected-art" src="${g.background || ph}" alt="${esc(g.name)}" onerror="this.src='${ph}'">
+    <div class="selected-info">
+      <div class="selected-title">${esc(g.name)}</div>
+      <div class="badge-row">
+        ${g.genres.slice(0,4).map(x => `<span class="badge badge-genre">${esc(x)}</span>`).join('')}
+      </div>
+      <div class="rating-row">
+        <span class="rating-val">${g.rating || '—'}</span>
+        <span>/ 5 &nbsp;·&nbsp; ${g.released ? g.released.slice(0,4) : 'N/A'}
+          ${g.metacritic ? `&nbsp;·&nbsp; Metacritic <b style="color:#fff">${g.metacritic}</b>` : ''}
+        </span>
+      </div>
+      ${g.description ? `<p class="selected-desc">${esc(g.description)}</p>` : ''}
+    </div>`;
+  show('selectedSection');
+}
+
+function renderRecs(recs) {
+  const ph = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="125"><rect fill="%230d0d16" width="200" height="125"/></svg>';
+  document.getElementById('recsGrid').innerHTML = recs.map((g, i) => `
+    <div class="rec-card stagger" style="animation-delay:${i * 0.08}s" onclick="selectGame(${g.id})">
+      <div class="rec-num">#${i + 1}</div>
+      <img class="rec-art" src="${g.background || ph}" alt="${esc(g.name)}" onerror="this.src='${ph}'">
+      <div class="rec-body">
+        <div class="rec-name">${esc(g.name)}</div>
+        <div class="rec-meta">
+          <span>${g.released ? g.released.slice(0,4) : 'N/A'}</span>
+          <span class="rec-rating">★ ${g.rating || '—'}</span>
+        </div>
+        <div class="sim-bar"><div class="sim-fill" data-pct="${g.similarity}"></div></div>
+        <div class="sim-label">Match: ${g.similarity}%</div>
+      </div>
+    </div>`).join('');
+
+  show('recsSection');
+  requestAnimationFrame(() => {
+    document.querySelectorAll('.sim-fill').forEach(el => { el.style.width = el.dataset.pct + '%'; });
+  });
+}
+
+/* ── HELPERS ────────────────────────────────────────────────────────────── */
+function show(id)          { document.getElementById(id).style.display = 'block'; }
+function hide(id)          { document.getElementById(id).style.display = 'none';  }
+function showLoading(on)   { document.getElementById('loading').className = 'loading-wrap' + (on ? ' active' : ''); }
+function showError(msg)    { errorEl.textContent = msg; errorEl.style.display = msg ? 'block' : 'none'; }
+function esc(s)            { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+/* ── CURSOR ─────────────────────────────────────────────────────────────── */
+const dot  = document.getElementById('cursor-dot');
+const ring = document.getElementById('cursor-ring');
+let mx = 0, my = 0, rx = 0, ry = 0;
+document.addEventListener('mousemove', e => { mx = e.clientX; my = e.clientY; });
+document.addEventListener('mousedown', () => document.body.classList.add('clicking'));
+document.addEventListener('mouseup',   () => document.body.classList.remove('clicking'));
+(function animCursor() {
+  rx += (mx - rx) * 0.13; ry += (my - ry) * 0.13;
+  dot.style.left  = mx + 'px'; dot.style.top  = my + 'px';
+  ring.style.left = rx + 'px'; ring.style.top = ry + 'px';
+  requestAnimationFrame(animCursor);
+})();
+
+/* ── PARTICLE FIELD ─────────────────────────────────────────────────────── */
+(function() {
+  const canvas = document.getElementById('bgCanvas');
+  const ctx    = canvas.getContext('2d');
+  let W, H;
+  const mouse  = { x: -999, y: -999 };
+
+  function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+  resize();
+  window.addEventListener('resize', resize);
+  document.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+
+  const COLORS = ['#00d2ff','#ff2ef7','#ffffff','#ffd700'];
+  const particles = Array.from({ length: 90 }, () => new Particle(true));
+
+  function Particle(init) {
+    this.reset = (init) => {
+      this.x  = Math.random() * (W || 1200);
+      this.y  = init ? Math.random() * (H || 800) : (H || 800) + 5;
+      this.vx = (Math.random() - 0.5) * 0.25;
+      this.vy = -(0.15 + Math.random() * 0.45);
+      this.r  = 0.6 + Math.random() * 1.6;
+      this.alpha = 0.2 + Math.random() * 0.55;
+      this.color = COLORS[Math.floor(Math.random() * COLORS.length)];
+      this.pulse = Math.random() * Math.PI * 2;
+      this.pulseSpeed = 0.015 + Math.random() * 0.03;
+    };
+    this.reset(init);
+
+    this.update = function() {
+      const dx = this.x - mouse.x, dy = this.y - mouse.y;
+      const d  = Math.sqrt(dx*dx + dy*dy);
+      if (d < 120) { const f = (120-d)/120; this.vx += dx/d*f*0.25; this.vy += dy/d*f*0.25; }
+      this.vx *= 0.97; this.vy *= 0.97;
+      this.x += this.vx; this.y += this.vy;
+      this.pulse += this.pulseSpeed;
+      if (this.y < -10 || this.x < -10 || this.x > W+10) this.reset(false);
+    };
+
+    this.draw = function() {
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.r, 0, Math.PI*2);
+      ctx.fillStyle  = this.color;
+      ctx.globalAlpha = this.alpha * (0.7 + 0.3 * Math.sin(this.pulse));
+      ctx.fill();
+    };
+  }
+
+  (function loop() {
+    ctx.clearRect(0, 0, W, H);
+    // connections
+    for (let i = 0; i < particles.length; i++)
+      for (let j = i+1; j < particles.length; j++) {
+        const dx = particles[i].x - particles[j].x, dy = particles[i].y - particles[j].y;
+        const d  = Math.sqrt(dx*dx + dy*dy);
+        if (d < 90) {
+          ctx.beginPath();
+          ctx.moveTo(particles[i].x, particles[i].y);
+          ctx.lineTo(particles[j].x, particles[j].y);
+          ctx.strokeStyle = '#00d2ff';
+          ctx.globalAlpha = (1 - d/90) * 0.08;
+          ctx.lineWidth   = 0.5;
+          ctx.stroke();
+        }
+      }
+    particles.forEach(p => { p.update(); p.draw(); });
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(loop);
+  })();
+})();
+</script>
+</body>
+</html>
