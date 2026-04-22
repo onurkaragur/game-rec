@@ -33,38 +33,92 @@ def steam_web_get(interface: str, method: str, params: dict = None) -> dict:
     return resp.json()
 
 def search_games(query: str, page_size: int = 8) -> list:
-    """Search for games using Steam's store search functionality."""
+    """
+    Search for games by fetching popular games and filtering by name.
+    SteamSpy doesn't have a search API, so we pool top games and filter locally.
+    """
     try:
-        # Use SteamSpy API for search (public, no key needed)
-        resp = requests.get(
-            "https://www.steamspy.com/api.php",
-            params={"request": "search", "query": query},
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        
+        query_lower = query.lower().strip()
         results = []
-        for app_id, game_info in list(data.items())[:page_size]:
-            if app_id == "error":
-                continue
+        seen = set()
+        
+        # ── Batch 1: Top 100 games from SteamSpy ──────────────────────────────
+        try:
+            spy_resp = requests.get(
+                "https://www.steamspy.com/api.php",
+                params={"request": "top100forever"},
+                timeout=10
+            ).json()
+            
+            for app_id_str in spy_resp.keys():
+                if app_id_str == "error" or app_id_str in seen:
+                    continue
+                try:
+                    app_id = int(app_id_str)
+                    if app_id in seen or len(results) >= page_size:
+                        continue
+                    
+                    game_data = get_game_detail(app_id)
+                    if game_data is None:  # Skip games that failed to load
+                        continue
+                    
+                    game_name = game_data.get("name", "").lower()
+                    
+                    # Simple substring match
+                    if query_lower in game_name:
+                        results.append({
+                            "id":         game_data["id"],
+                            "name":       game_data["name"],
+                            "background": game_data.get("background", ""),
+                            "rating":     game_data.get("rating", 0),
+                            "released":   game_data.get("released", ""),
+                            "genres":     game_data.get("genres", []),
+                        })
+                        seen.add(app_id)
+                except Exception as e:
+                    logging.debug(f"Failed to process game {app_id_str}: {e}")
+                    continue
+        except Exception as e:
+            logging.warning(f"SteamSpy top100 fetch failed: {e}")
+        
+        # ── Batch 2: Featured games from Steam Store ──────────────────────────
+        if len(results) < page_size:
             try:
-                app_id = int(app_id)
-                game_data = get_game_detail(app_id)
-                results.append({
-                    "id":         game_data["id"],
-                    "name":       game_data["name"],
-                    "background": game_data.get("background", ""),
-                    "rating":     game_data.get("rating", 0),
-                    "released":   game_data.get("released", ""),
-                    "genres":     game_data.get("genres", []),
-                })
+                featured = steam_store_get("/featured", {})
+                for game in featured.get("featured_win", [])[:50]:
+                    if len(results) >= page_size:
+                        break
+                    
+                    app_id = game.get("id")
+                    if app_id in seen:
+                        continue
+                    
+                    try:
+                        game_data = get_game_detail(app_id)
+                        if game_data is None:  # Skip games that failed to load
+                            continue
+                        
+                        game_name = game_data.get("name", "").lower()
+                        
+                        if query_lower in game_name:
+                            results.append({
+                                "id":         game_data["id"],
+                                "name":       game_data["name"],
+                                "background": game_data.get("background", ""),
+                                "rating":     game_data.get("rating", 0),
+                                "released":   game_data.get("released", ""),
+                                "genres":     game_data.get("genres", []),
+                            })
+                            seen.add(app_id)
+                    except Exception as e:
+                        logging.debug(f"Failed to process featured game {app_id}: {e}")
+                        continue
             except Exception as e:
-                logging.warning(f"Failed to load game {app_id}: {e}")
-                continue
-        return results
+                logging.warning(f"Featured games fetch failed: {e}")
+        
+        return results[:page_size]
     except Exception as e:
-        logging.warning(f"Search via SteamSpy failed: {e}")
+        logging.error(f"Search failed: {e}")
         return []
 
 def get_game_detail(app_id: int) -> dict:
@@ -73,7 +127,7 @@ def get_game_detail(app_id: int) -> dict:
         store_data = steam_store_get(f"/appdetails", {"appids": app_id})
         
         if not store_data.get(str(app_id), {}).get("success"):
-            raise ValueError(f"Game {app_id} not found")
+            return None  # Game not found, return None instead of raising
         
         app_data = store_data[str(app_id)]["data"]
         
@@ -113,8 +167,8 @@ def get_game_detail(app_id: int) -> dict:
             "price":       app_data.get("price_overview", {}).get("final", 0) / 100,
         }
     except Exception as e:
-        logging.error(f"Error fetching game details for {app_id}: {e}")
-        raise
+        logging.warning(f"Error fetching game details for {app_id}: {e}")
+        return None  # Return None on error, don't raise
 
 def _get_platforms(app_data: dict) -> list:
     """Extract platform info from Steam app data."""
@@ -181,6 +235,9 @@ def fetch_candidates(genres: list, tags: list, exclude_id: int, count: int = 80)
                     continue
                 
                 game_detail = get_game_detail(app_id)
+                if game_detail is None:  # Skip failed loads
+                    continue
+                
                 game_genres = game_detail.get("genres", [])
                 game_tags = game_detail.get("tags", [])
                 
@@ -210,6 +267,8 @@ def fetch_candidates(genres: list, tags: list, exclude_id: int, count: int = 80)
                         continue
                     try:
                         game_detail = get_game_detail(app_id)
+                        if game_detail is None:  # Skip failed loads
+                            continue
                         candidate = _parse_candidate(game_detail)
                         if candidate:
                             candidates.append(candidate)
@@ -340,6 +399,8 @@ def api_search():
 def api_recommend(game_id: int):
     try:
         seed = get_game_detail(game_id)
+        if seed is None:
+            return jsonify({"error": f"Game {game_id} not found on Steam"}), 404
         
         # Extract genres and tags for candidate fetching
         seed_genres = seed.get("genres", [])
