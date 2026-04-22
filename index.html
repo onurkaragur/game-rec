@@ -314,12 +314,8 @@ header { text-align: center; margin-bottom: 44px; animation: fadeDown 0.8s ease 
   </header>
 
   <!-- API Key Banner -->
-  <div id="apiBanner">
-    <p>⚠ <strong>RAWG API key not set.</strong> Get a free key at <strong>rawg.io/apidocs</strong>, then paste it below.</p>
-    <div class="api-input-row">
-      <input id="apiKeyInput" type="text" placeholder="Paste your RAWG API key here…" />
-      <button id="apiKeySave" onclick="saveApiKey()">SAVE</button>
-    </div>
+  <div id="apiBanner" style="display: none;">
+    <p>✓ <strong>Steam integration ready.</strong> Start searching for games!</p>
   </div>
 
   <!-- Search -->
@@ -347,201 +343,23 @@ header { text-align: center; margin-bottom: 44px; animation: fadeDown 0.8s ease 
 
 <script>
 /* ══════════════════════════════════════════════════════════════════════════
-   CONFIG  —  paste your free RAWG API key here OR use the banner above
-   Get one at: https://rawg.io/apidocs
+   Steam API Backend Integration
+   All API calls go through the Flask backend at /api/
    ══════════════════════════════════════════════════════════════════════════ */
-let RAWG_KEY = localStorage.getItem('rawg_key') || '';
-const RAWG   = 'https://api.rawg.io/api';
 
-/* ── API KEY MANAGEMENT ─────────────────────────────────────────────────── */
-function saveApiKey() {
-  const val = document.getElementById('apiKeyInput').value.trim();
-  if (!val) return;
-  RAWG_KEY = val;
-  localStorage.setItem('rawg_key', val);
-  document.getElementById('apiBanner').style.display = 'none';
-  showError('');
-}
+const API_BASE = '/api';
 
-function checkApiKey() {
-  if (!RAWG_KEY) {
-    document.getElementById('apiBanner').style.display = 'block';
-    return false;
-  }
-  return true;
-}
-
-window.addEventListener('DOMContentLoaded', () => {
-  if (!RAWG_KEY) document.getElementById('apiBanner').style.display = 'block';
-});
-
-/* ── RAWG API HELPERS ───────────────────────────────────────────────────── */
-async function rawg(path, params = {}) {
-  params.key = RAWG_KEY;
-  const qs = new URLSearchParams(params).toString();
-  const res = await fetch(`${RAWG}${path}?${qs}`);
-  if (!res.ok) throw new Error(`RAWG ${res.status}: ${res.statusText}`);
+/* ── BACKEND API HELPERS ────────────────────────────────────────────────── */
+async function apiSearchGames(q) {
+  const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(q)}`);
+  if (!res.ok) throw new Error(`Search failed: ${res.statusText}`);
   return res.json();
 }
 
-async function searchGames(q) {
-  const data = await rawg('/games', { search: q, page_size: 8, search_precise: true });
-  return (data.results || []).map(g => ({
-    id:         g.id,
-    name:       g.name,
-    background: g.background_image || '',
-    rating:     g.rating || 0,
-    released:   g.released || '',
-    genres:     (g.genres || []).map(x => x.name),
-    genre_ids:  (g.genres || []).map(x => x.id),
-    tags:       (g.tags  || []).slice(0, 30).map(x => x.id),
-  }));
-}
-
-async function getGameDetail(id) {
-  const g = await rawg(`/games/${id}`);
-  return {
-    id:          g.id,
-    name:        g.name,
-    background:  g.background_image || '',
-    rating:      g.rating || 0,
-    metacritic:  g.metacritic || 0,
-    playtime:    g.playtime   || 0,
-    released:    g.released   || '',
-    description: (g.description_raw || g.description || '').replace(/<[^>]+>/g,'').slice(0, 280),
-    genres:      (g.genres    || []).map(x => x.name),
-    genre_ids:   (g.genres    || []).map(x => x.id),
-    tags:        (g.tags      || []).slice(0, 30).map(x => x.id),
-    platforms:   (g.platforms || []).map(x => x.platform.id),
-  };
-}
-
-async function fetchCandidates(seed) {
-  const genreIds  = seed.genre_ids || [];
-  const tagIds    = seed.tags || [];
-  const excludeId = seed.id;
-
-  const genresStr = genreIds.slice(0, 3).join(',');
-  const tagsStr   = tagIds.slice(0, 4).join(',');
-
-  const seen = new Set();
-  const candidates = [];
-
-  function parseGame(g) {
-    return {
-      id:         g.id,
-      name:       g.name,
-      background: g.background_image || '',
-      rating:     g.rating     || 0,
-      metacritic: g.metacritic || 0,
-      playtime:   g.playtime   || 0,
-      released:   g.released   || '',
-      genres:     (g.genres    || []).map(x => x.name),
-      genre_ids:  (g.genres    || []).map(x => x.id),
-      tags:       (g.tags      || []).slice(0, 30).map(x => x.id),
-      platforms:  (g.platforms || []).map(x => x.platform.id),
-    };
-  }
-
-  // ── Batch 1: genre-based, two pages (broad genre pool) ──────────────────
-  for (let page = 1; page <= 2; page++) {
-    try {
-      const data = await rawg('/games', { genres: genresStr, ordering: '-rating', page_size: 30, page });
-      for (const g of (data.results || [])) {
-        if (g.id === excludeId || seen.has(g.id)) continue;
-        seen.add(g.id);
-        candidates.push(parseGame(g));
-      }
-    } catch(e) { /* skip failed pages */ }
-  }
-
-  // ── Batch 2: tag-based, one page (thematic reinforcement) ───────────────
-  if (tagsStr) {
-    try {
-      const data = await rawg('/games', { tags: tagsStr, ordering: '-rating', page_size: 30, page: 1 });
-      for (const g of (data.results || [])) {
-        if (g.id === excludeId || seen.has(g.id)) continue;
-        seen.add(g.id);
-        candidates.push(parseGame(g));
-      }
-    } catch(e) { /* tag fetch failed, genre results still available */ }
-  }
-
-  // ── Quality filter ───────────────────────────────────────────────────────
-  return candidates.filter(c => c.rating >= 1.5 || c.metacritic >= 40);
-}
-
-/* ── ML: COSINE SIMILARITY RECOMMENDER ─────────────────────────────────── */
-/*
- * Weight rationale
- * ─────────────────────────────────────────────────────────────────────────
- * primaryGenre (×14): The #1 signal. Visual-novel → visual-novels.
- * otherGenres  (×10): Strong genre overlap still matters a great deal.
- * seedTags     (×6) : Tags shared with the seed are the game's thematic DNA
- *                     (mechanics, mood, setting). Strong match = high sim.
- * otherTags    (×0.8): Tags present only in the candidate are near-noise —
- *                      kept tiny to avoid zero-vectors, not to inflate sim.
- * platforms    (×0.2): Cross-platform era — irrelevant for theme matching.
- * metacritic   (×0.4): Quality signal, must not override theme alignment.
- * playtime     (×0.2): Very weak — genre similarity dominates.
- * ─────────────────────────────────────────────────────────────────────────
- */
-function buildVector(game, seedTagSet, primaryGenre, allGenres, allTags, allPlats) {
-  const gameGenreSet = new Set(game.genre_ids || []);
-  const gameTagSet   = new Set(game.tags      || []);
-  const gamePlatSet  = new Set(game.platforms  || []);
-
-  const genreVec = allGenres.map(g => {
-    if (!gameGenreSet.has(g)) return 0.0;
-    return g === primaryGenre ? 14.0 : 10.0;
-  });
-
-  const tagVec = allTags.map(t => {
-    if (!gameTagSet.has(t)) return 0.0;
-    return seedTagSet.has(t) ? 6.0 : 0.8;
-  });
-
-  const platVec = allPlats.map(p => gamePlatSet.has(p) ? 0.2 : 0.0);
-  const meta    = [(game.metacritic || 0) / 100 * 0.4];
-  const play    = [Math.log1p(game.playtime || 0) / 5.0 * 0.2];
-
-  return [...genreVec, ...tagVec, ...platVec, ...meta, ...play];
-}
-
-function cosineSim(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
-  const denom = Math.sqrt(na) * Math.sqrt(nb);
-  return denom === 0 ? 0 : dot / denom;
-}
-
-function recommend(seed, candidates, topN = 5) {
-  const all = [seed, ...candidates];
-  const allGenres = [...new Set(all.flatMap(g => g.genre_ids || []))].sort();
-  const allTags   = [...new Set(all.flatMap(g => g.tags      || []))].sort();
-  const allPlats  = [...new Set(all.flatMap(g => g.platforms  || []))].sort();
-
-  const seedTagSet    = new Set(seed.tags      || []);
-  const primaryGenre  = (seed.genre_ids || [])[0] ?? null;
-
-  const seedVec = buildVector(seed, seedTagSet, primaryGenre, allGenres, allTags, allPlats);
-  const scored  = candidates.map(c => ({
-    ...c,
-    sim: cosineSim(seedVec, buildVector(c, seedTagSet, primaryGenre, allGenres, allTags, allPlats))
-  }));
-
-  return scored
-    .sort((a, b) => b.sim - a.sim)
-    .slice(0, topN)
-    .map(c => ({
-      id:         c.id,
-      name:       c.name,
-      background: c.background,
-      rating:     c.rating,
-      released:   c.released,
-      genres:     c.genres,
-      similarity: Math.round(c.sim * 100 * 10) / 10,
-    }));
+async function apiRecommend(gameId) {
+  const res = await fetch(`${API_BASE}/recommend/${gameId}`);
+  if (!res.ok) throw new Error(`Recommendation failed: ${res.statusText}`);
+  return res.json();
 }
 
 /* ── SEARCH UI ──────────────────────────────────────────────────────────── */
@@ -554,7 +372,6 @@ searchInput.addEventListener('input', () => {
   clearTimeout(debounceTimer);
   const q = searchInput.value.trim();
   if (q.length < 2) { closeDropdown(); return; }
-  // Clear previous results as soon as the user starts a new search
   hide('selectedSection');
   hide('recsSection');
   showError('');
@@ -566,12 +383,11 @@ document.addEventListener('click', e => { if (!e.target.closest('.search-wrap'))
 function closeDropdown() { dropdown.classList.remove('open'); dropdown.innerHTML = ''; }
 
 async function fetchSuggestions(q) {
-  if (!checkApiKey()) return;
-  dropdown.innerHTML = `<div class="dd-spinner">Scanning database…</div>`;
+  dropdown.innerHTML = `<div class="dd-spinner">Scanning Steam database…</div>`;
   dropdown.classList.add('open');
   try {
-    const games = await searchGames(q);
-    if (!games.length) { dropdown.innerHTML = `<div class="dd-spinner">No results found.</div>`; return; }
+    const games = await apiSearchGames(q);
+    if (!games || !games.length) { dropdown.innerHTML = `<div class="dd-spinner">No results found.</div>`; return; }
     dropdown.innerHTML = games.map(g => `
       <div class="dropdown-item" onclick="selectGame(${g.id})">
         <img class="dropdown-thumb" src="${g.background || ''}" alt=""
@@ -590,22 +406,19 @@ async function fetchSuggestions(q) {
 
 /* ── SELECT GAME ────────────────────────────────────────────────────────── */
 async function selectGame(id) {
-  if (!checkApiKey()) return;
   closeDropdown();
   searchInput.value = '';
   showLoading(true);
   showError('');
-  hide('selectedSection'); hide('recsSection');
+  hide('selectedSection');
+  hide('recsSection');
 
   try {
-    const seed       = await getGameDetail(id);
-    const candidates = await fetchCandidates(seed);
-    const recs       = recommend(seed, candidates);
-    renderSelected(seed);
-    renderRecs(recs);
+    const data = await apiRecommend(id);
+    renderSelected(data.seed);
+    renderRecs(data.recommendations);
   } catch(err) {
-    showError('Failed to load: ' + err.message +
-      (err.message.includes('401') ? ' — Check your RAWG API key.' : ''));
+    showError('Failed to load: ' + err.message);
   } finally {
     showLoading(false);
   }
@@ -623,8 +436,8 @@ function renderSelected(g) {
       </div>
       <div class="rating-row">
         <span class="rating-val">${g.rating || '—'}</span>
-        <span>/ 5 &nbsp;·&nbsp; ${g.released ? g.released.slice(0,4) : 'N/A'}
-          ${g.metacritic ? `&nbsp;·&nbsp; Metacritic <b style="color:#fff">${g.metacritic}</b>` : ''}
+        <span>/ 100 &nbsp;·&nbsp; ${g.released ? g.released.slice(0,4) : 'N/A'}
+          ${g.price ? `&nbsp;·&nbsp; $${(g.price/100).toFixed(2)}` : ' &nbsp;·&nbsp; Free'}
         </span>
       </div>
       ${g.description ? `<p class="selected-desc">${esc(g.description)}</p>` : ''}

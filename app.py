@@ -3,169 +3,263 @@ import requests
 import numpy as np
 from flask import Flask, request, jsonify, render_template
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MultiLabelBinarizer, MinMaxScaler
 import logging
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-from config import RAWG_API_KEY, RAWG_BASE
+from config import STEAM_API_KEY, STEAM_BASE, STEAM_STORE_BASE
 
-# ── RAWG HELPERS ─────────────────────────────────────────────────────────────
-def rawg_get(path: str, params: dict = None) -> dict:
+# ── STEAM HELPERS ────────────────────────────────────────────────────────────
+STEAM_APP_CACHE = {}
+CACHE_DURATION = timedelta(hours=24)
+
+def steam_store_get(path: str, params: dict = None) -> dict:
+    """Fetch from Steam Store API (public, no key required)."""
     params = params or {}
-    params["key"] = RAWG_API_KEY
-    resp = requests.get(f"{RAWG_BASE}{path}", params=params, timeout=10)
+    resp = requests.get(f"{STEAM_STORE_BASE}{path}", params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+def steam_web_get(interface: str, method: str, params: dict = None) -> dict:
+    """Fetch from Steam Web API (requires API key for some endpoints)."""
+    params = params or {}
+    params["key"] = STEAM_API_KEY
+    url = f"{STEAM_BASE}/{interface}/{method}/v1"
+    resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 def search_games(query: str, page_size: int = 8) -> list:
-    """Autocomplete / search endpoint for the search bar."""
-    data = rawg_get("/games", {"search": query, "page_size": page_size,
-                               "search_precise": True})
-    results = []
-    for g in data.get("results", []):
-        results.append({
-            "id":         g["id"],
-            "name":       g["name"],
-            "background": g.get("background_image") or "",
-            "rating":     g.get("rating", 0),
-            "released":   g.get("released", ""),
-            "genres":     [x["name"] for x in g.get("genres", [])],
-        })
-    return results
+    """Search for games using Steam's store search functionality."""
+    try:
+        # Use SteamSpy API for search (public, no key needed)
+        resp = requests.get(
+            "https://www.steamspy.com/api.php",
+            params={"request": "search", "query": query},
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        results = []
+        for app_id, game_info in list(data.items())[:page_size]:
+            if app_id == "error":
+                continue
+            try:
+                app_id = int(app_id)
+                game_data = get_game_detail(app_id)
+                results.append({
+                    "id":         game_data["id"],
+                    "name":       game_data["name"],
+                    "background": game_data.get("background", ""),
+                    "rating":     game_data.get("rating", 0),
+                    "released":   game_data.get("released", ""),
+                    "genres":     game_data.get("genres", []),
+                })
+            except Exception as e:
+                logging.warning(f"Failed to load game {app_id}: {e}")
+                continue
+        return results
+    except Exception as e:
+        logging.warning(f"Search via SteamSpy failed: {e}")
+        return []
 
-def get_game_detail(game_id: int) -> dict:
-    """Fetch full game details including tags and metacritic."""
-    g = rawg_get(f"/games/{game_id}")
-    return {
-        "id":         g["id"],
-        "name":       g["name"],
-        "background": g.get("background_image") or "",
-        "rating":     g.get("rating", 0),
-        "metacritic": g.get("metacritic") or 0,
-        "playtime":   g.get("playtime") or 0,
-        "released":   g.get("released", ""),
-        "description": _clean_html(g.get("description_raw") or g.get("description", "")),
-        "genres":     [x["name"] for x in g.get("genres", [])],
-        "genre_ids":  [x["id"]   for x in g.get("genres", [])],
-        "tags":       [x["id"]   for x in g.get("tags", [])[:30]],
-        "tag_names":  [x["name"] for x in g.get("tags", [])[:30]],
-        "platforms":  [x["platform"]["id"] for x in g.get("platforms", [])],
-        "developers": [x["name"] for x in g.get("developers", [])],
-    }
+def get_game_detail(app_id: int) -> dict:
+    """Fetch full game details from Steam Store API."""
+    try:
+        store_data = steam_store_get(f"/appdetails", {"appids": app_id})
+        
+        if not store_data.get(str(app_id), {}).get("success"):
+            raise ValueError(f"Game {app_id} not found")
+        
+        app_data = store_data[str(app_id)]["data"]
+        
+        # Extract categories (genres in Steam)
+        categories = [cat["description"] for cat in app_data.get("categories", [])]
+        genre_list = [g["description"] for g in app_data.get("genres", [])]
+        
+        # Get tags from SteamSpy if available
+        try:
+            spy_data = requests.get(
+                f"https://www.steamspy.com/api.php",
+                params={"request": "appdetails", "appid": app_id},
+                timeout=5
+            ).json()
+            user_score = spy_data.get("score_rank", 0)
+            tags = list(spy_data.get("tags", {}).keys())[:30]
+        except:
+            user_score = 0
+            tags = []
+        
+        release_date = app_data.get("release_date", {}).get("date", "")
+        
+        return {
+            "id":          app_id,
+            "name":        app_data.get("name", ""),
+            "background":  app_data.get("header_image", ""),
+            "rating":      user_score,
+            "released":    release_date,
+            "description": _clean_html(app_data.get("short_description", ""))[:280],
+            "genres":      genre_list,
+            "genre_ids":   [i for i in range(len(genre_list))],  # Use indices as IDs
+            "tags":        tags,
+            "tag_names":   tags,
+            "categories":  categories,
+            "platforms":   _get_platforms(app_data),
+            "developers":  [d for d in app_data.get("developers", [])],
+            "price":       app_data.get("price_overview", {}).get("final", 0) / 100,
+        }
+    except Exception as e:
+        logging.error(f"Error fetching game details for {app_id}: {e}")
+        raise
+
+def _get_platforms(app_data: dict) -> list:
+    """Extract platform info from Steam app data."""
+    platforms = []
+    if app_data.get("platforms", {}).get("windows"):
+        platforms.append("Windows")
+    if app_data.get("platforms", {}).get("mac"):
+        platforms.append("macOS")
+    if app_data.get("platforms", {}).get("linux"):
+        platforms.append("Linux")
+    return platforms
 
 def _clean_html(text: str) -> str:
+    """Remove HTML tags from text."""
     import re
-    return re.sub(r"<[^>]+>", "", text)[:280]
+    return re.sub(r"<[^>]+>", "", text)
 
-# ── CANDIDATE FETCHER ────────────────────────────────────────────────────────
-def _parse_candidate(g: dict) -> dict:
-    """Parse a RAWG game result dict into our candidate schema."""
-    return {
-        "id":         g["id"],
-        "name":       g["name"],
-        "background": g.get("background_image") or "",
-        "rating":     g.get("rating", 0),
-        "metacritic": g.get("metacritic") or 0,
-        "playtime":   g.get("playtime") or 0,
-        "released":   g.get("released", ""),
-        "genres":     [x["name"] for x in g.get("genres", [])],
-        "genre_ids":  [x["id"]   for x in g.get("genres", [])],
-        "tags":       [x["id"]   for x in g.get("tags", [])[:30]],
-        "platforms":  [x["platform"]["id"] for x in g.get("platforms", [])],
-    }
+# ── CANDIDATE FETCHER ───────────────────────────────────────────────────────
+def _parse_candidate(app_data: dict) -> dict:
+    """Parse a Steam game dict into our candidate schema."""
+    try:
+        return {
+            "id":         app_data["id"],
+            "name":       app_data["name"],
+            "background": app_data.get("background", ""),
+            "rating":     app_data.get("rating", 0),
+            "released":   app_data.get("released", ""),
+            "genres":     app_data.get("genres", []),
+            "genre_ids":  app_data.get("genre_ids", []),
+            "tags":       app_data.get("tags", []),
+            "categories": app_data.get("categories", []),
+        }
+    except Exception as e:
+        logging.error(f"Error parsing candidate: {e}")
+        return {}
 
-def fetch_candidates(genre_ids: list, tag_ids: list, exclude_id: int, count: int = 80) -> list:
+def fetch_candidates(genres: list, tags: list, exclude_id: int, count: int = 80) -> list:
     """
-    Pull a rich candidate pool using two complementary strategies:
-      1. Genre-based  — 2 pages ordered by rating (broad genre match)
-      2. Tag-based    — 1 page using seed's top 4 tags (thematic/mechanic match)
-    Results are deduplicated by ID. Low-quality games are filtered out.
+    Fetch candidate games from Steam using multiple strategies:
+      1. Genre-based — Pull popular games in similar genres
+      2. Tag-based — Pull games with similar tags/categories
+    
+    Since Steam API doesn't have rich filtering, we use SteamSpy's popularity data
+    and filter by genres/tags locally.
     """
-    genres_str = ",".join(str(x) for x in genre_ids[:3])
-    top_tags   = ",".join(str(x) for x in tag_ids[:4])
-
-    seen: set = set()
-    candidates: list = []
-
-    # ── Batch 1: genre-based, two pages ──────────────────────────────────────
-    for page in range(1, 3):
-        try:
-            data = rawg_get("/games", {
-                "genres":    genres_str,
-                "ordering":  "-rating",
-                "page_size": 30,
-                "page":      page,
-            })
-            for g in data.get("results", []):
-                if g["id"] == exclude_id or g["id"] in seen:
+    candidates = []
+    seen = {exclude_id}
+    
+    try:
+        # Get popular games from SteamSpy and filter by genre/tag overlap
+        spy_resp = requests.get(
+            "https://www.steamspy.com/api.php",
+            params={"request": "top100forever"},
+            timeout=10
+        ).json()
+        
+        for app_id_str, spy_data in spy_resp.items():
+            if app_id_str == "error":
+                continue
+            
+            try:
+                app_id = int(app_id_str)
+                if app_id in seen or app_id == exclude_id:
                     continue
-                seen.add(g["id"])
-                candidates.append(_parse_candidate(g))
-        except Exception as exc:
-            logging.warning("Genre fetch page %d failed: %s", page, exc)
+                
+                game_detail = get_game_detail(app_id)
+                game_genres = game_detail.get("genres", [])
+                game_tags = game_detail.get("tags", [])
+                
+                # Check for genre or tag overlap
+                genre_overlap = any(g in game_genres for g in genres)
+                tag_overlap = any(t in game_tags for t in tags)
+                
+                if genre_overlap or tag_overlap or not genres:  # Include if any overlap or no genre filter
+                    candidate = _parse_candidate(game_detail)
+                    if candidate:
+                        candidates.append(candidate)
+                        seen.add(app_id)
+                    
+                    if len(candidates) >= count:
+                        break
+            except Exception as e:
+                logging.warning(f"Failed to load candidate {app_id_str}: {e}")
+                continue
+        
+        # If we don't have enough, fetch more from featured games
+        if len(candidates) < count // 2:
+            try:
+                featured = steam_store_get("/featured", {})
+                for game in featured.get("featured_win", [])[:30]:
+                    app_id = game.get("id")
+                    if app_id in seen or app_id == exclude_id:
+                        continue
+                    try:
+                        game_detail = get_game_detail(app_id)
+                        candidate = _parse_candidate(game_detail)
+                        if candidate:
+                            candidates.append(candidate)
+                            seen.add(app_id)
+                        if len(candidates) >= count:
+                            break
+                    except Exception as e:
+                        logging.warning(f"Failed to load featured game {app_id}: {e}")
+                        continue
+            except Exception as e:
+                logging.warning(f"Featured games fetch failed: {e}")
+        
+        return candidates[:count]
+    except Exception as e:
+        logging.error(f"Candidate fetch failed: {e}")
+        return []
 
-    # ── Batch 2: tag-based, one page (thematic reinforcement) ─────────────────
-    if top_tags:
-        try:
-            data = rawg_get("/games", {
-                "tags":      top_tags,
-                "ordering":  "-rating",
-                "page_size": 30,
-                "page":      1,
-            })
-            for g in data.get("results", []):
-                if g["id"] == exclude_id or g["id"] in seen:
-                    continue
-                seen.add(g["id"])
-                candidates.append(_parse_candidate(g))
-        except Exception as exc:
-            logging.warning("Tag fetch failed: %s", exc)
-
-    # ── Quality filter: drop very low-rated games ─────────────────────────────
-    candidates = [
-        c for c in candidates
-        if c["rating"] >= 1.5 or c["metacritic"] >= 40
-    ]
-
-    return candidates[:count]
-
-# ── ML RECOMMENDER ───────────────────────────────────────────────────────────
+# ── ML RECOMMENDER ──────────────────────────────────────────────────────────
 def build_feature_matrix(seed: dict, candidates: list):
     """
-    Seed-overlap-aware content-based feature engineering.
+    Seed-overlap-aware content-based feature engineering for Steam games.
 
     Weight rationale
     ─────────────────────────────────────────────────────────────────────────
-    • Primary genre (×14): The single most important signal. A visual-novel
-      must recommend visual-novels; an RPG must recommend RPGs.
+    • Primary genre (×14): The single most important signal. A tactical game
+      must recommend tactical games; an RPG must recommend RPGs.
     • Other genres  (×10): Strong genre overlap still matters a lot.
-    • Seed-matched tags (×6): Tags the seed game has are the game's "DNA"
-      (mechanics, themes, mood). A candidate sharing those tags is a very
-      strong thematic match.
-    • Other tags (×0.8): Tags present in a candidate but absent from the seed
-      are near-noise — we keep a tiny weight to avoid zero-vectors but they
-      should not inflate similarity.
-    • Platforms (×0.2): Cross-platform era; irrelevant for theme/genre match.
-    • Metacritic / Playtime: Very low weights — quality is a secondary signal
-      and must not override genre/theme alignment.
+    • Seed-matched tags (×6): Tags are Steam community tags representing the
+      game's core mechanics, themes, and mood. High overlap = strong match.
+    • Other tags (×0.8): Tags not in seed but in candidate; background signal.
+    • Categories (×4): Steam-defined categories (single-player, multiplayer, etc)
+    • Price similarity (×0.5): Games in similar price ranges may appeal similarly
     ─────────────────────────────────────────────────────────────────────────
     """
     all_games      = [seed] + candidates
-    all_genres     = sorted({g for game in all_games for g in game.get("genre_ids", [])})
+    all_genres     = sorted({g for game in all_games for g in game.get("genres", [])})
     all_tags       = sorted({t for game in all_games for t in game.get("tags", [])})
-    all_plats      = sorted({p for game in all_games for p in game.get("platforms", [])})
+    all_categories = sorted({c for game in all_games for c in game.get("categories", [])})
 
     seed_tag_set   = set(seed.get("tags", []))
-    seed_genres    = seed.get("genre_ids", [])
+    seed_genres    = seed.get("genres", [])
+    seed_categories = set(seed.get("categories", []))
+    seed_price     = seed.get("price", 0)
     primary_genre  = seed_genres[0] if seed_genres else None
 
     def encode(game: dict) -> np.ndarray:
-        game_genre_set = set(game.get("genre_ids", []))
+        game_genre_set = set(game.get("genres", []))
         game_tag_set   = set(game.get("tags", []))
-        game_plat_set  = set(game.get("platforms", []))
+        game_category_set = set(game.get("categories", []))
+        game_price = game.get("price", 0)
 
         # Genre vector — primary genre gets extra weight
         genre_vec = [
@@ -179,22 +273,31 @@ def build_feature_matrix(seed: dict, candidates: list):
             for t in all_tags
         ]
 
-        # Platform vector — minimal contribution
-        plat_vec = [0.2 if p in game_plat_set else 0.0 for p in all_plats]
+        # Category vector
+        cat_vec = [
+            4.0 if c in game_category_set and c in seed_categories else
+            (2.0 if c in game_category_set else 0.0)
+            for c in all_categories
+        ]
 
-        # Quality scalars — kept low so they don't override theme alignment
-        meta = [game.get("metacritic", 0) / 100.0 * 0.4]
-        play = [np.log1p(game.get("playtime", 0)) / 5.0 * 0.2]
+        # Price similarity — games at similar price points
+        price_diff = abs(game_price - seed_price) / max(seed_price, 1.0)
+        price_sim = [(1.0 - min(price_diff, 1.0)) * 0.5]
 
-        return np.array(genre_vec + tag_vec + plat_vec + meta + play, dtype=np.float32)
+        # Rating as secondary signal
+        rating = [game.get("rating", 0) / 100.0 * 0.3]
+
+        return np.array(genre_vec + tag_vec + cat_vec + price_sim + rating, dtype=np.float32)
 
     seed_vec  = encode(seed)
     cand_vecs = np.array([encode(c) for c in candidates])
     return seed_vec, cand_vecs
 
 def recommend(seed: dict, candidates: list, top_n: int = 5) -> list:
+    """Generate recommendations using cosine similarity."""
     if not candidates:
         return []
+    
     seed_vec, cand_vecs = build_feature_matrix(seed, candidates)
 
     # Cosine similarity between seed and every candidate
@@ -216,7 +319,7 @@ def recommend(seed: dict, candidates: list, top_n: int = 5) -> list:
         })
     return results
 
-# ── ROUTES ───────────────────────────────────────────────────────────────────
+# ── ROUTES ──────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -227,7 +330,8 @@ def api_search():
     if len(q) < 2:
         return jsonify([])
     try:
-        return jsonify(search_games(q))
+        results = search_games(q)
+        return jsonify(results)
     except Exception as exc:
         logging.error("Search error: %s", exc)
         return jsonify({"error": str(exc)}), 500
@@ -235,9 +339,15 @@ def api_search():
 @app.route("/api/recommend/<int:game_id>")
 def api_recommend(game_id: int):
     try:
-        seed       = get_game_detail(game_id)
-        candidates = fetch_candidates(seed["genre_ids"], seed["tags"], exclude_id=game_id)
-        recs       = recommend(seed, candidates)
+        seed = get_game_detail(game_id)
+        
+        # Extract genres and tags for candidate fetching
+        seed_genres = seed.get("genres", [])
+        seed_tags = seed.get("tags", [])
+        
+        candidates = fetch_candidates(seed_genres, seed_tags, exclude_id=game_id)
+        recs = recommend(seed, candidates)
+        
         return jsonify({"seed": seed, "recommendations": recs})
     except Exception as exc:
         logging.error("Recommend error: %s", exc)
