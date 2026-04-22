@@ -6,7 +6,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 import logging
 from datetime import datetime, timedelta
 
-app = Flask(__name__)
+# Configure Flask to look for templates in the current directory
+app = Flask(__name__, template_folder='.')
 logging.basicConfig(level=logging.INFO)
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
